@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v1.4.4"
+SCRIPT_VERSION="v1.4.5"
 SCRIPT_NAME="by2tool"
 SCRIPT_OWNER="BoYuan"
 SCRIPT_TITLE="BoYuan运维工具箱"
@@ -787,6 +787,131 @@ for repo, tags in data.items():
 ' || true
 }
 
+validate_import_archive() {
+  local tar_file="$1"
+
+  require_cmd tar
+
+  if ! tar -tf "$tar_file" >/dev/null 2>&1; then
+    echo "镜像包无法读取：$tar_file" >&2
+    echo "处理建议：请确认文件是否完整传输，或重新导出镜像包。" >&2
+    return 2
+  fi
+
+  local python_bin=""
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then
+    python_bin="python3"
+  elif command -v python >/dev/null 2>&1 && python -c 'import sys' >/dev/null 2>&1; then
+    python_bin="python"
+  fi
+
+  if [[ -z "$python_bin" ]]; then
+    echo "提示：未检测到可用 Python，已完成 tar 可读性检查，跳过 blob 引用深度校验。"
+    return 0
+  fi
+
+  PYTHONIOENCODING=UTF-8 "$python_bin" - "$tar_file" <<'PY'
+import json
+import sys
+import tarfile
+
+archive = sys.argv[1]
+
+def blob_path(digest):
+    if not digest:
+        return None
+    if digest.startswith("sha256:"):
+        return "blobs/sha256/" + digest.split(":", 1)[1]
+    return digest
+
+def read_json(tf, name):
+    try:
+        member = members.get(name)
+        if member is None:
+            return None
+        item = tf.extractfile(member)
+        if item is None:
+            return None
+        return json.load(item)
+    except KeyError:
+        return None
+    except Exception as exc:
+        print(f"镜像包 JSON 无法解析：{name}：{exc}", file=sys.stderr)
+        sys.exit(2)
+
+try:
+    with tarfile.open(archive, "r") as tf:
+        members = {}
+        for item in tf.getmembers():
+            name = item.name
+            while name.startswith("./"):
+                name = name[2:]
+            members[name] = item
+        missing = []
+        bad_size = []
+
+        def require(name, expected_size=None, where=""):
+            if not name:
+                return
+            item = members.get(name)
+            if item is None:
+                missing.append((name, where))
+                return
+            if expected_size is not None and item.size != expected_size:
+                bad_size.append((name, item.size, expected_size, where))
+
+        # Docker save 的 manifest.json。
+        manifest = read_json(tf, "manifest.json")
+        if isinstance(manifest, list):
+            for idx, item in enumerate(manifest):
+                require(item.get("Config"), where=f"manifest.json[{idx}].Config")
+                for layer in item.get("Layers", []):
+                    require(layer, where=f"manifest.json[{idx}].Layers")
+                for digest, source in item.get("LayerSources", {}).items():
+                    require(
+                        blob_path(source.get("digest", digest)),
+                        source.get("size"),
+                        f"manifest.json[{idx}].LayerSources",
+                    )
+
+        # Docker 新版本/containerd image store 导出的 OCI index。
+        index = read_json(tf, "index.json")
+        if isinstance(index, dict):
+            for idx, desc in enumerate(index.get("manifests", [])):
+                manifest_path = blob_path(desc.get("digest"))
+                require(manifest_path, desc.get("size"), f"index.json.manifests[{idx}]")
+                image_manifest = read_json(tf, manifest_path) if manifest_path in members else None
+                if isinstance(image_manifest, dict):
+                    config = image_manifest.get("config", {})
+                    require(
+                        blob_path(config.get("digest")),
+                        config.get("size"),
+                        f"{manifest_path}.config",
+                    )
+                    for layer_idx, layer in enumerate(image_manifest.get("layers", [])):
+                        require(
+                            blob_path(layer.get("digest")),
+                            layer.get("size"),
+                            f"{manifest_path}.layers[{layer_idx}]",
+                        )
+
+        if missing or bad_size:
+            print("镜像包结构不完整，Docker load 会失败。", file=sys.stderr)
+            for name, where in missing[:10]:
+                print(f"缺少文件：{name}（引用位置：{where}）", file=sys.stderr)
+            for name, actual, expected, where in bad_size[:10]:
+                print(
+                    f"文件大小不匹配：{name} 当前 {actual}，期望 {expected}（引用位置：{where}）",
+                    file=sys.stderr,
+                )
+            print("处理建议：请重新拷贝镜像包，或在源机器重新导出；传输前后可用 sha256sum 比对。", file=sys.stderr)
+            sys.exit(2)
+except tarfile.TarError as exc:
+    print(f"镜像包无法读取：{archive}：{exc}", file=sys.stderr)
+    sys.exit(2)
+PY
+}
+
 import_images() {
   cd "$WORKDIR"
 
@@ -808,6 +933,8 @@ import_images() {
   fi
 
   require_cmd docker
+  validate_import_archive "$IMPORT_FILE"
+  echo "步骤完成：镜像包预检通过：$IMPORT_FILE"
   echo "开始导入镜像包：$IMPORT_FILE"
   docker load -i "$IMPORT_FILE"
   echo "步骤完成：镜像包已导入：$IMPORT_FILE"
