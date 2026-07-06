@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v1.4.0"
+SCRIPT_VERSION="v1.4.2"
 SCRIPT_NAME="by2tool"
 SCRIPT_OWNER="BoYuan"
 SCRIPT_TITLE="BoYuan运维工具箱"
@@ -48,8 +48,10 @@ SHOW_IMAGES_AFTER_IMPORT="${SHOW_IMAGES_AFTER_IMPORT:-true}"
 # 导入后是否执行 docker compose up -d。默认 false，避免导入镜像时顺手改变运行状态。
 RUN_COMPOSE_UP="${RUN_COMPOSE_UP:-false}"
 
-# 自动更新源。可以是 http(s) URL，也可以是本机文件路径；为空时菜单会提示未配置。
-UPDATE_SOURCE="${UPDATE_SOURCE:-}"
+# 自动更新源。默认 auto：GitHub 可用时走 GitHub，访问不通时切到 Gitee。
+GITHUB_UPDATE_SOURCE="${GITHUB_UPDATE_SOURCE:-https://raw.githubusercontent.com/xboyuan/by2tool/main/by2tool}"
+GITEE_UPDATE_SOURCE="${GITEE_UPDATE_SOURCE:-https://gitee.com/bydzlby/by2tool/raw/main/by2tool}"
+UPDATE_SOURCE="${UPDATE_SOURCE:-auto}"
 
 # 如果为空，则从 docker compose config 解析镜像列表；如果指定文件，则使用该文件里的镜像列表。
 IMAGE_LIST="${IMAGE_LIST:-}"
@@ -139,13 +141,14 @@ BoYuan运维工具箱采用单脚本交付，当前功能集中在“镜像迁�
   --no-restore             导出后不恢复当前机器镜像架构
   --compose-up             导入后执行 docker compose up -d
   --no-show-images         导入后不显示导入包内的 RepoTags
-  --update-source SRC      自动更新源，支持 URL 或本机文件路径
+  --update-source SRC      自动更新源，支持 auto、github、gitee、URL 或本机文件路径
   --dry-run                只预演，不拉镜像、不保存/导入 tar、不启动 compose
   --print-config           打印最终生效配置并退出
   -h, --help               显示帮助
 
 更新脚本说明：
-  需要先在脚本顶部配置 UPDATE_SOURCE，或执行时传 --update-source。
+  默认 auto 会先探测 GitHub Raw；GitHub 不通时使用 Gitee Raw。
+  也可以执行时传 --update-source 临时覆盖。
   更新前会备份当前脚本，并对新脚本执行 bash -n 语法检查；检查失败不会替换当前脚本。
 EOF
 }
@@ -252,6 +255,8 @@ RESTORE_AFTER_EXPORT=$RESTORE_AFTER_EXPORT
 SHOW_IMAGES_AFTER_IMPORT=$SHOW_IMAGES_AFTER_IMPORT
 RUN_COMPOSE_UP=$RUN_COMPOSE_UP
 UPDATE_SOURCE=$UPDATE_SOURCE
+GITHUB_UPDATE_SOURCE=$GITHUB_UPDATE_SOURCE
+GITEE_UPDATE_SOURCE=$GITEE_UPDATE_SOURCE
 IMAGE_LIST=$IMAGE_LIST
 ALL_LIST=$ALL_LIST
 EXPORT_LIST=$EXPORT_LIST
@@ -865,6 +870,46 @@ run_service_action() {
   echo "步骤完成：服务${action}完成"
 }
 
+update_source_reachable() {
+  local source="$1"
+
+  case "$source" in
+    http://*|https://*)
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsIL --connect-timeout 3 --max-time 5 "$source" >/dev/null 2>&1
+      elif command -v wget >/dev/null 2>&1; then
+        wget --spider -q -T 5 "$source" >/dev/null 2>&1
+      else
+        return 1
+      fi
+      ;;
+    *)
+      [[ -f "$source" ]]
+      ;;
+  esac
+}
+
+resolve_update_source() {
+  case "${UPDATE_SOURCE,,}" in
+    ""|auto)
+      if update_source_reachable "$GITHUB_UPDATE_SOURCE"; then
+        printf '%s' "$GITHUB_UPDATE_SOURCE"
+      else
+        printf '%s' "$GITEE_UPDATE_SOURCE"
+      fi
+      ;;
+    github)
+      printf '%s' "$GITHUB_UPDATE_SOURCE"
+      ;;
+    gitee)
+      printf '%s' "$GITEE_UPDATE_SOURCE"
+      ;;
+    *)
+      printf '%s' "$UPDATE_SOURCE"
+      ;;
+  esac
+}
+
 self_update() {
   if [[ -z "$UPDATE_SOURCE" ]]; then
     echo "未配置 UPDATE_SOURCE，无法自动更新。"
@@ -873,18 +918,20 @@ self_update() {
     return 2
   fi
 
-  local self tmp backup
+  local self tmp backup actual_source
   self="$(readlink -f "$0")"
   tmp="$(mktemp)"
   backup="${self}.bak.$(date +%Y%m%d%H%M%S)"
+  actual_source="$(resolve_update_source)"
 
-  echo "更新源：$UPDATE_SOURCE"
-  case "$UPDATE_SOURCE" in
+  echo "更新源模式：$UPDATE_SOURCE"
+  echo "实际更新源：$actual_source"
+  case "$actual_source" in
     http://*|https://*)
       if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$UPDATE_SOURCE" -o "$tmp"
+        curl -fsSL "$actual_source" -o "$tmp"
       elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$tmp" "$UPDATE_SOURCE"
+        wget -qO "$tmp" "$actual_source"
       else
         echo "缺少 curl 或 wget，无法从 URL 更新。" >&2
         rm -f "$tmp"
@@ -892,12 +939,12 @@ self_update() {
       fi
       ;;
     *)
-      if [[ ! -f "$UPDATE_SOURCE" ]]; then
-        echo "更新源文件不存在：$UPDATE_SOURCE" >&2
+      if [[ ! -f "$actual_source" ]]; then
+        echo "更新源文件不存在：$actual_source" >&2
         rm -f "$tmp"
         return 66
       fi
-      cp "$UPDATE_SOURCE" "$tmp"
+      cp "$actual_source" "$tmp"
       ;;
   esac
 
