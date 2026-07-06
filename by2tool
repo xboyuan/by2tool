@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v1.4.5"
+SCRIPT_VERSION="v1.4.6"
 SCRIPT_NAME="by2tool"
 SCRIPT_OWNER="BoYuan"
 SCRIPT_TITLE="BoYuan运维工具箱"
@@ -28,6 +28,9 @@ RESTORE_PLATFORM="${RESTORE_PLATFORM:-linux/amd64}"
 
 # 导出的 docker save 包名。留空时会按 PLATFORM 自动生成，例如 support_all_images_amd64.tar。
 OUT="${OUT:-}"
+
+# 导出包格式。docker 表示兼容老版本 docker load 的 Docker archive；oci 保留 Docker 27+ 默认 OCI 风格。
+EXPORT_ARCHIVE_FORMAT="${EXPORT_ARCHIVE_FORMAT:-docker}"
 
 # 导入的 tar 文件。留空时默认使用 OUT。
 IMPORT_FILE="${IMPORT_FILE:-}"
@@ -133,6 +136,7 @@ BoYuan运维工具箱采用单脚本交付，当前功能集中在“镜像迁�
   --platform PLATFORM      目标导出架构，例如 linux/amd64、linux/arm64、linux/arm/v7
   --restore-platform P     导出完成后恢复当前机器镜像 tag 的架构
   --out FILE               输出的 docker save tar 文件；不指定则按平台自动生成
+  --archive-format FORMAT  导出包格式：docker 兼容老 docker load，oci 保留原始 OCI 风格
   --in FILE                导入的 docker save tar 文件；不指定则默认使用 OUT
   --image IMAGE            只导出单个镜像时使用的镜像名
   --registry-prefix PREFIX 只处理指定仓库前缀；传空字符串可处理所有带 / 的镜像
@@ -161,6 +165,7 @@ while [[ $# -gt 0 ]]; do
     --platform) PLATFORM="$2"; shift 2 ;;
     --restore-platform) RESTORE_PLATFORM="$2"; shift 2 ;;
     --out) OUT="$2"; OUT_WAS_SET=true; shift 2 ;;
+    --archive-format) EXPORT_ARCHIVE_FORMAT="$2"; shift 2 ;;
     --in) IMPORT_FILE="$2"; IMPORT_FILE_WAS_SET=true; shift 2 ;;
     --image) SINGLE_IMAGE="$2"; shift 2 ;;
     --registry-prefix) REGISTRY_PREFIX="$2"; shift 2 ;;
@@ -190,6 +195,11 @@ normalize_registry_prefix() {
 }
 
 REGISTRY_PREFIX="$(normalize_registry_prefix "$REGISTRY_PREFIX")"
+EXPORT_ARCHIVE_FORMAT="${EXPORT_ARCHIVE_FORMAT,,}"
+case "$EXPORT_ARCHIVE_FORMAT" in
+  docker|oci) ;;
+  *) echo "未知 EXPORT_ARCHIVE_FORMAT：$EXPORT_ARCHIVE_FORMAT，仅支持 docker 或 oci" >&2; exit 64 ;;
+esac
 
 platform_suffix() {
   local platform="$1"
@@ -248,6 +258,7 @@ WORKDIR=$WORKDIR
 PLATFORM=$PLATFORM
 RESTORE_PLATFORM=$RESTORE_PLATFORM
 OUT=$OUT
+EXPORT_ARCHIVE_FORMAT=$EXPORT_ARCHIVE_FORMAT
 IMPORT_FILE=$IMPORT_FILE
 SINGLE_IMAGE=$SINGLE_IMAGE
 REGISTRY_PREFIX=$REGISTRY_PREFIX
@@ -397,6 +408,174 @@ human_file_size() {
   }'
 }
 
+find_python_bin() {
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then
+    printf 'python3'
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1 && python -c 'import sys' >/dev/null 2>&1; then
+    printf 'python'
+    return 0
+  fi
+  return 1
+}
+
+convert_oci_archive_to_docker_archive() {
+  local source_tar="$1"
+  local target_tar="$2"
+  local python_bin
+
+  python_bin="$(find_python_bin)" || {
+    echo "缺少可用 Python，无法把 OCI 风格镜像包转换为兼容 Docker archive。" >&2
+    echo "处理建议：安装 python3，或临时设置 EXPORT_ARCHIVE_FORMAT=oci 保留原始格式。" >&2
+    return 127
+  }
+
+  PYTHONIOENCODING=UTF-8 "$python_bin" - "$source_tar" "$target_tar" <<'PY'
+import copy
+import hashlib
+import io
+import json
+import shutil
+import sys
+import tarfile
+
+source, target = sys.argv[1], sys.argv[2]
+
+def normalize(name):
+    while name.startswith("./"):
+        name = name[2:]
+    return name
+
+def add_bytes(tf, name, data, mode=0o644):
+    raw = data if isinstance(data, bytes) else data.encode("utf-8")
+    info = tarfile.TarInfo(name)
+    info.size = len(raw)
+    info.mode = mode
+    info.mtime = 0
+    tf.addfile(info, io.BytesIO(raw))
+
+def add_dir(tf, name, dirs):
+    name = name.rstrip("/")
+    if not name or name in dirs:
+        return
+    parent = name.rsplit("/", 1)[0] if "/" in name else ""
+    if parent:
+        add_dir(tf, parent, dirs)
+    info = tarfile.TarInfo(name + "/")
+    info.type = tarfile.DIRTYPE
+    info.mode = 0o755
+    info.mtime = 0
+    tf.addfile(info)
+    dirs.add(name)
+
+def split_repo_tag(repo_tag):
+    slash = repo_tag.rfind("/")
+    colon = repo_tag.rfind(":")
+    if colon <= slash:
+        return None, None
+    return repo_tag[:colon], repo_tag[colon + 1:]
+
+with tarfile.open(source, "r") as src:
+    members = {}
+    for item in src.getmembers():
+        members[normalize(item.name)] = item
+
+    manifest_member = members.get("manifest.json")
+    if manifest_member is None:
+        shutil.copyfile(source, target)
+        sys.exit(0)
+
+    manifest = json.load(src.extractfile(manifest_member))
+    if not isinstance(manifest, list):
+        shutil.copyfile(source, target)
+        sys.exit(0)
+
+    needs_convert = "oci-layout" in members or any(
+        str(item.get("Config", "")).startswith("blobs/")
+        or any(str(layer).startswith("blobs/") for layer in item.get("Layers", []))
+        for item in manifest
+    )
+    if not needs_convert:
+        shutil.copyfile(source, target)
+        sys.exit(0)
+
+    output_manifest = []
+    repositories = {}
+    added_layers = set()
+    added_dirs = set()
+    added_configs = set()
+
+    with tarfile.open(target, "w") as out:
+        for image_index, item in enumerate(manifest):
+            config_path = normalize(item.get("Config", ""))
+            config_member = members.get(config_path)
+            if config_member is None:
+                raise SystemExit(f"missing config blob: {config_path}")
+
+            config_base = config_path.rsplit("/", 1)[-1]
+            config_name = f"{config_base}.json"
+            if config_name not in added_configs:
+                config_file = src.extractfile(config_member)
+                if config_file is None:
+                    raise SystemExit(f"cannot read config blob: {config_path}")
+                info = tarfile.TarInfo(config_name)
+                info.size = config_member.size
+                info.mode = 0o644
+                info.mtime = 0
+                out.addfile(info, config_file)
+                added_configs.add(config_name)
+
+            parent = ""
+            converted_layers = []
+            for layer_index, layer_path in enumerate(item.get("Layers", [])):
+                layer_path = normalize(layer_path)
+                layer_member = members.get(layer_path)
+                if layer_member is None:
+                    raise SystemExit(f"missing layer blob: {layer_path}")
+
+                layer_key = layer_path.rsplit("/", 1)[-1]
+                chain_id = hashlib.sha256(f"{parent}\n{layer_key}".encode("utf-8")).hexdigest()
+                layer_dir = chain_id
+                layer_tar = f"{layer_dir}/layer.tar"
+
+                if chain_id not in added_layers:
+                    add_dir(out, layer_dir, added_dirs)
+                    add_bytes(out, f"{layer_dir}/VERSION", "1.0\n")
+                    layer_meta = {"id": layer_dir}
+                    if parent:
+                        layer_meta["parent"] = parent
+                    add_bytes(out, f"{layer_dir}/json", json.dumps(layer_meta, separators=(",", ":")) + "\n")
+
+                    layer_file = src.extractfile(layer_member)
+                    if layer_file is None:
+                        raise SystemExit(f"cannot read layer blob: {layer_path}")
+                    info = tarfile.TarInfo(layer_tar)
+                    info.size = layer_member.size
+                    info.mode = 0o644
+                    info.mtime = 0
+                    out.addfile(info, layer_file)
+                    added_layers.add(chain_id)
+
+                converted_layers.append(layer_tar)
+                parent = layer_dir
+
+            repo_tags = [tag for tag in item.get("RepoTags", []) if tag and tag != "<none>:<none>"]
+            for repo_tag in repo_tags:
+                repo, tag = split_repo_tag(repo_tag)
+                if repo and tag and parent:
+                    repositories.setdefault(repo, {})[tag] = parent
+
+            new_item = copy.deepcopy(item)
+            new_item["Config"] = config_name
+            new_item["Layers"] = converted_layers
+            output_manifest.append(new_item)
+
+        add_bytes(out, "manifest.json", json.dumps(output_manifest, separators=(",", ":")) + "\n")
+        add_bytes(out, "repositories", json.dumps(repositories, separators=(",", ":")) + "\n")
+PY
+}
+
 render_packaging_progress() {
   local out_file="$1"
   local signal="$2"
@@ -450,6 +629,23 @@ save_images_with_progress() {
   fi
 
   render_packaging_progress "$out_file" "OK" "$start_time"
+
+  if [[ "$rc" -eq 0 && "$EXPORT_ARCHIVE_FORMAT" == "docker" ]]; then
+    local converted_file
+    converted_file="${out_file}.docker-archive.$$"
+    log_only "converting $out_file to docker-compatible archive"
+    if convert_oci_archive_to_docker_archive "$out_file" "$converted_file" >> "$LOG" 2>&1; then
+      mv -f "$converted_file" "$out_file"
+      step_done "镜像包已转换为兼容 Docker archive 格式，可在老版本 docker load 中导入"
+    else
+      rm -f "$converted_file"
+      echo "镜像包格式转换失败：$out_file" >&2
+      return 2
+    fi
+  elif [[ "$rc" -eq 0 ]]; then
+    step_done "镜像包保留 OCI 风格格式"
+  fi
+
   return "$rc"
 }
 
@@ -521,8 +717,10 @@ describe_export_source() {
 describe_export_action() {
   if [[ "$DRY_RUN" == true ]]; then
     printf '只预演，不拉取镜像，不生成 tar 包'
+  elif [[ "$EXPORT_ARCHIVE_FORMAT" == "docker" ]]; then
+    printf '拉取目标平台镜像，生成兼容老 docker load 的 Docker archive 包'
   else
-    printf '拉取目标平台镜像并生成 docker save 包'
+    printf '拉取目标平台镜像，保留 Docker 默认 OCI 风格镜像包'
   fi
 }
 
