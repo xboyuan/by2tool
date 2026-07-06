@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v1.4.2"
+SCRIPT_VERSION="v1.4.3"
 SCRIPT_NAME="by2tool"
 SCRIPT_OWNER="BoYuan"
 SCRIPT_TITLE="BoYuan运维工具箱"
@@ -35,8 +35,8 @@ IMPORT_FILE="${IMPORT_FILE:-}"
 # 只导出单个镜像时使用的镜像名。
 SINGLE_IMAGE="${SINGLE_IMAGE:-}"
 
-# 只处理这个仓库前缀下的镜像；本地短名镜像会跳过。
-# 如果希望处理所有带 / 的镜像，把它设置为空：REGISTRY_PREFIX=""
+# 批量导出时只处理这个仓库前缀下的镜像；单镜像导出以用户输入为准，不受此前缀限制。
+# 如果批量导出希望处理所有带 / 的镜像，把它设置为空：REGISTRY_PREFIX=""
 REGISTRY_PREFIX="${REGISTRY_PREFIX:-harbor.kocel.com:8082/}"
 
 # true：导出成功后，只恢复本次实际导出的镜像；默认不恢复，避免额外改动本机镜像。
@@ -490,6 +490,81 @@ is_registry_image() {
   [[ "$image" == */* ]]
 }
 
+describe_export_scope() {
+  if [[ "$MODE" == "export-one" ]]; then
+    printf '单个镜像，不使用仓库前缀过滤'
+    return
+  fi
+
+  if [[ -n "$IMAGE_LIST" ]]; then
+    printf '镜像清单文件：%s' "$IMAGE_LIST"
+    return
+  fi
+
+  if [[ -n "$REGISTRY_PREFIX" ]]; then
+    printf '仓库/项目前缀：%s*' "$REGISTRY_PREFIX"
+  else
+    printf '所有带 / 的镜像'
+  fi
+}
+
+describe_export_source() {
+  if [[ "$MODE" == "export-one" ]]; then
+    printf '%s' "$SINGLE_IMAGE"
+  elif [[ -n "$IMAGE_LIST" ]]; then
+    printf '%s' "$IMAGE_LIST"
+  else
+    printf 'docker compose config'
+  fi
+}
+
+describe_export_action() {
+  if [[ "$DRY_RUN" == true ]]; then
+    printf '只预演，不拉取镜像，不生成 tar 包'
+  else
+    printf '拉取目标平台镜像并生成 docker save 包'
+  fi
+}
+
+describe_restore_action() {
+  if [[ "$RESTORE_AFTER_EXPORT" == true ]]; then
+    printf '导出成功后，仅把本次导出的镜像恢复为 %s' "$RESTORE_PLATFORM"
+  else
+    printf '不会恢复本机镜像架构'
+  fi
+}
+
+render_export_confirmation() {
+  local operation
+  local source
+  local scope
+  local action
+  local restore_action
+
+  if [[ "$MODE" == "export-one" ]]; then
+    operation="单镜像导出"
+  else
+    operation="批量导出 Compose 镜像"
+  fi
+
+  source="$(describe_export_source)"
+  scope="$(describe_export_scope)"
+  action="$(describe_export_action)"
+  restore_action="$(describe_restore_action)"
+
+  echo "┌─ 导出确认清单"
+  printf '  操作：%s\n' "$operation"
+  printf '  来源：%s\n' "$source"
+  printf '  范围：%s\n' "$scope"
+  printf '  平台：%s\n' "$PLATFORM"
+  printf '  输出：%s\n' "$OUT"
+  printf '  执行：%s\n' "$action"
+  printf '  本机影响：%s\n' "$restore_action"
+  printf '  工作目录：%s\n' "$WORKDIR"
+  printf '  记录：日志 %s；导出清单 %s；跳过清单 %s\n' "$LOG" "$EXPORT_LIST" "$SKIP_LIST"
+  echo "└────────────────────────────────────────"
+}
+
 restore_tags() {
   [[ "$RESTORE_AFTER_EXPORT" == true ]] || return 0
   [[ "$DRY_RUN" == false ]] || return 0
@@ -644,12 +719,6 @@ export_one_image() {
 
   log "effective config:"
   print_config | tee -a "$LOG"
-
-  if ! is_registry_image "$SINGLE_IMAGE"; then
-    append_skip "$SINGLE_IMAGE" "not matched by REGISTRY_PREFIX or local short-name image"
-    step_done "单镜像检查完成：该镜像不匹配当前仓库前缀，未导出"
-    return 2
-  fi
 
   if [[ "$DRY_RUN" == true ]]; then
     render_export_progress 1 1 "单镜像预演：$PLATFORM" "镜像" "$SINGLE_IMAGE"
@@ -1199,8 +1268,7 @@ interactive_export() {
   if ask_yes_no "是否只预演 dry-run" "n"; then DRY_RUN=true; else DRY_RUN=false; fi
   if ask_yes_no "导出后是否恢复本机为 $RESTORE_PLATFORM" "n"; then RESTORE_AFTER_EXPORT=true; else RESTORE_AFTER_EXPORT=false; fi
   echo
-  echo "即将导出："
-  print_config
+  render_export_confirmation
   echo
   local rc=0
   if ask_yes_no "确认开始导出" "y"; then
@@ -1244,8 +1312,7 @@ interactive_export_one() {
   if ask_yes_no "是否只预演 dry-run" "n"; then DRY_RUN=true; else DRY_RUN=false; fi
   if ask_yes_no "导出后是否恢复本机为 $RESTORE_PLATFORM" "n"; then RESTORE_AFTER_EXPORT=true; else RESTORE_AFTER_EXPORT=false; fi
   echo
-  echo "即将导出单个镜像："
-  print_config
+  render_export_confirmation
   echo
   local rc=0
   if ask_yes_no "确认开始导出" "y"; then
