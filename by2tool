@@ -1,0 +1,1322 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_VERSION="v1.4.0"
+SCRIPT_NAME="by2tool"
+SCRIPT_OWNER="BoYuan"
+SCRIPT_TITLE="BoYuan运维工具箱"
+
+# ===== 默认配置区 =====
+# 日常使用时只需要执行：./by2tool，然后按菜单选择功能模块。
+# 如果换系统、换目录、换默认架构，优先改这里的默认值。
+# 外部也可以临时覆盖：
+#   PLATFORM=linux/arm64 ./by2tool --mode export
+#   ./by2tool --mode export-one --image harbor.kocel.com:8082/ktmp/tmp-ai:1.0.0
+#   ./by2tool --mode import --in support_all_images_arm64.tar
+
+# 默认操作：menu 表示进入交互菜单；也可以外部指定 export、import、update。
+MODE="${MODE:-menu}"
+
+# docker-compose.yml 所在目录。
+WORKDIR="${WORKDIR:-/home/data/jar}"
+
+# 目标系统架构。默认导出 x86/amd64；给 ARM 系统做包时可在菜单里选择，或外部指定 linux/arm64。
+PLATFORM="${PLATFORM:-linux/amd64}"
+
+# 导出完成后，把当前测试机上的同名镜像 tag 拉回这个架构，避免 x86 测试环境留下 ARM 镜像。
+RESTORE_PLATFORM="${RESTORE_PLATFORM:-linux/amd64}"
+
+# 导出的 docker save 包名。留空时会按 PLATFORM 自动生成，例如 support_all_images_amd64.tar。
+OUT="${OUT:-}"
+
+# 导入的 tar 文件。留空时默认使用 OUT。
+IMPORT_FILE="${IMPORT_FILE:-}"
+
+# 只导出单个镜像时使用的镜像名。
+SINGLE_IMAGE="${SINGLE_IMAGE:-}"
+
+# 只处理这个仓库前缀下的镜像；本地短名镜像会跳过。
+# 如果希望处理所有带 / 的镜像，把它设置为空：REGISTRY_PREFIX=""
+REGISTRY_PREFIX="${REGISTRY_PREFIX:-harbor.kocel.com:8082/}"
+
+# true：导出成功后，只恢复本次实际导出的镜像；默认不恢复，避免额外改动本机镜像。
+RESTORE_AFTER_EXPORT="${RESTORE_AFTER_EXPORT:-false}"
+
+# 导入后是否显示导入包里的 RepoTags。
+SHOW_IMAGES_AFTER_IMPORT="${SHOW_IMAGES_AFTER_IMPORT:-true}"
+
+# 导入后是否执行 docker compose up -d。默认 false，避免导入镜像时顺手改变运行状态。
+RUN_COMPOSE_UP="${RUN_COMPOSE_UP:-false}"
+
+# 自动更新源。可以是 http(s) URL，也可以是本机文件路径；为空时菜单会提示未配置。
+UPDATE_SOURCE="${UPDATE_SOURCE:-}"
+
+# 如果为空，则从 docker compose config 解析镜像列表；如果指定文件，则使用该文件里的镜像列表。
+IMAGE_LIST="${IMAGE_LIST:-}"
+
+# 中间文件和日志文件名。留空时会按 PLATFORM 自动生成。
+ALL_LIST="${ALL_LIST:-images.list}"
+EXPORT_LIST="${EXPORT_LIST:-}"
+SKIP_LIST="${SKIP_LIST:-}"
+LOG="${LOG:-}"
+
+# true：只预演，不执行 docker pull、docker save、docker load、docker compose up。
+DRY_RUN="${DRY_RUN:-false}"
+PRINT_CONFIG="${PRINT_CONFIG:-false}"
+INTERACTIVE=false
+OUT_WAS_SET=false
+IMPORT_FILE_WAS_SET=false
+[[ -n "$OUT" ]] && OUT_WAS_SET=true
+[[ -n "$IMPORT_FILE" ]] && IMPORT_FILE_WAS_SET=true
+
+
+supports_color() {
+  [[ -r /dev/tty && -w /dev/tty ]] && [[ "${TERM:-}" != "" ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]
+}
+
+if supports_color; then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_CYAN=$'\033[36m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_REVERSE=$'\033[7m'
+else
+  C_RESET=""
+  C_DIM=""
+  C_BOLD=""
+  C_CYAN=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_REVERSE=""
+fi
+
+usage() {
+  cat <<'EOF'
+用法：
+  ./by2tool
+  ./by2tool --mode export
+#   ./by2tool --mode export-one --image harbor.kocel.com:8082/ktmp/tmp-ai:1.0.0
+  ./by2tool --mode import --in support_all_images_arm64.tar
+  ./by2tool --mode check
+  ./by2tool --mode service-status
+  ./by2tool --mode update
+
+BoYuan运维工具箱采用单脚本交付，当前功能集中在“镜像迁移中心”。默认不传参数时进入 BoYuan 光标菜单。真实 SSH 终端中可用方向键选择，Enter 确认，q 退出；非 TTY 环境会自动回退为数字菜单。日常配置维护在脚本顶部的默认配置区；需要临时调整时，可以用环境变量或参数做外部覆盖。
+
+常用示例：
+  ./by2tool
+  ./by2tool --mode export
+#   ./by2tool --mode export-one --image harbor.kocel.com:8082/ktmp/tmp-ai:1.0.0
+  PLATFORM=linux/arm64 ./by2tool --mode export
+#   ./by2tool --mode export-one --image harbor.kocel.com:8082/ktmp/tmp-ai:1.0.0
+  ./by2tool --mode import --in support_all_images_arm64.tar
+  ./by2tool --mode check
+  ./by2tool --mode service-status
+  ./by2tool --mode export --dry-run
+  ./by2tool --mode export --registry-prefix 'harbor.kocel.com:8082/*'
+  ./by2tool --mode export --registry-prefix 'harbor.kocel.com:8082/ktmp/*'
+
+功能模块：
+  镜像迁移中心          导出全部镜像、导出单个镜像、导入镜像包
+  导出范围              支持 Harbor 全仓库、项目路径前缀、自定义前缀筛选
+  环境检查              检查 Docker、Compose、工作目录、compose 文件和镜像包
+  服务启停              查看服务状态，带确认地执行启动、停止、重启
+
+可选参数：
+  --interactive            强制进入交互菜单
+  --mode MODE              操作模式：menu、export、export-one、import、check、service-status、update
+  --workdir DIR            docker-compose.yml 所在目录
+  --platform PLATFORM      目标导出架构，例如 linux/amd64、linux/arm64、linux/arm/v7
+  --restore-platform P     导出完成后恢复当前机器镜像 tag 的架构
+  --out FILE               输出的 docker save tar 文件；不指定则按平台自动生成
+  --in FILE                导入的 docker save tar 文件；不指定则默认使用 OUT
+  --image IMAGE            只导出单个镜像时使用的镜像名
+  --registry-prefix PREFIX 只处理指定仓库前缀；传空字符串可处理所有带 / 的镜像
+  --image-list FILE        使用指定镜像列表，不从 docker compose config 解析
+  --restore                导出成功后恢复本次实际导出的镜像到 restore-platform
+  --no-restore             导出后不恢复当前机器镜像架构
+  --compose-up             导入后执行 docker compose up -d
+  --no-show-images         导入后不显示导入包内的 RepoTags
+  --update-source SRC      自动更新源，支持 URL 或本机文件路径
+  --dry-run                只预演，不拉镜像、不保存/导入 tar、不启动 compose
+  --print-config           打印最终生效配置并退出
+  -h, --help               显示帮助
+
+更新脚本说明：
+  需要先在脚本顶部配置 UPDATE_SOURCE，或执行时传 --update-source。
+  更新前会备份当前脚本，并对新脚本执行 bash -n 语法检查；检查失败不会替换当前脚本。
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --interactive) INTERACTIVE=true; MODE=menu; shift ;;
+    --mode) MODE="$2"; shift 2 ;;
+    --workdir) WORKDIR="$2"; shift 2 ;;
+    --platform) PLATFORM="$2"; shift 2 ;;
+    --restore-platform) RESTORE_PLATFORM="$2"; shift 2 ;;
+    --out) OUT="$2"; OUT_WAS_SET=true; shift 2 ;;
+    --in) IMPORT_FILE="$2"; IMPORT_FILE_WAS_SET=true; shift 2 ;;
+    --image) SINGLE_IMAGE="$2"; shift 2 ;;
+    --registry-prefix) REGISTRY_PREFIX="$2"; shift 2 ;;
+    --image-list) IMAGE_LIST="$2"; shift 2 ;;
+    --restore) RESTORE_AFTER_EXPORT=true; shift ;;
+    --no-restore) RESTORE_AFTER_EXPORT=false; shift ;;
+    --compose-up) RUN_COMPOSE_UP=true; shift ;;
+    --no-show-images) SHOW_IMAGES_AFTER_IMPORT=false; shift ;;
+    --update-source) UPDATE_SOURCE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --print-config) PRINT_CONFIG=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "未知参数：$1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+normalize_registry_prefix() {
+  local prefix="$1"
+  prefix="${prefix%\"}"
+  prefix="${prefix#\"}"
+  prefix="${prefix%\'}"
+  prefix="${prefix#\'}"
+  if [[ "$prefix" == *'*' ]]; then
+    prefix="${prefix%\*}"
+  fi
+  printf '%s' "$prefix"
+}
+
+REGISTRY_PREFIX="$(normalize_registry_prefix "$REGISTRY_PREFIX")"
+
+platform_suffix() {
+  local platform="$1"
+  platform="${platform#linux/}"
+  platform="${platform//\//_}"
+  printf '%s' "$platform"
+}
+
+single_image_default_out() {
+  local image="$1"
+  image="${image//\//_}"
+  image="${image//:/_}"
+  image="${image//@/_}"
+  printf 'single_%s_%s.tar' "$image" "$(platform_suffix "$PLATFORM")"
+}
+
+apply_derived_defaults() {
+  PLATFORM_SUFFIX="$(platform_suffix "$PLATFORM")"
+  if [[ "$MODE" == "export-one" && -n "$SINGLE_IMAGE" && "$OUT_WAS_SET" != true ]]; then
+    OUT="$(single_image_default_out "$SINGLE_IMAGE")"
+  else
+    OUT="${OUT:-support_all_images_${PLATFORM_SUFFIX}.tar}"
+  fi
+  IMPORT_FILE="${IMPORT_FILE:-$OUT}"
+  if [[ "$MODE" == "export-one" ]]; then
+    EXPORT_LIST="${EXPORT_LIST:-single_${PLATFORM_SUFFIX}_export_images.list}"
+    SKIP_LIST="${SKIP_LIST:-single_${PLATFORM_SUFFIX}_skipped_images.list}"
+    LOG="${LOG:-single_${PLATFORM_SUFFIX}_export.log}"
+  else
+    EXPORT_LIST="${EXPORT_LIST:-${PLATFORM_SUFFIX}_export_images.list}"
+    SKIP_LIST="${SKIP_LIST:-${PLATFORM_SUFFIX}_skipped_images.list}"
+    LOG="${LOG:-${PLATFORM_SUFFIX}_export.log}"
+  fi
+}
+
+apply_derived_defaults
+
+reset_platform_derived_names() {
+  OUT=""
+  IMPORT_FILE=""
+  EXPORT_LIST=""
+  SKIP_LIST=""
+  LOG=""
+  OUT_WAS_SET=false
+  IMPORT_FILE_WAS_SET=false
+  apply_derived_defaults
+}
+
+print_config() {
+  cat <<EOF
+SCRIPT_VERSION=$SCRIPT_VERSION
+SCRIPT_NAME=$SCRIPT_NAME
+MODE=$MODE
+SCRIPT_TITLE=$SCRIPT_TITLE
+WORKDIR=$WORKDIR
+PLATFORM=$PLATFORM
+RESTORE_PLATFORM=$RESTORE_PLATFORM
+OUT=$OUT
+IMPORT_FILE=$IMPORT_FILE
+SINGLE_IMAGE=$SINGLE_IMAGE
+REGISTRY_PREFIX=$REGISTRY_PREFIX
+RESTORE_AFTER_EXPORT=$RESTORE_AFTER_EXPORT
+SHOW_IMAGES_AFTER_IMPORT=$SHOW_IMAGES_AFTER_IMPORT
+RUN_COMPOSE_UP=$RUN_COMPOSE_UP
+UPDATE_SOURCE=$UPDATE_SOURCE
+IMAGE_LIST=$IMAGE_LIST
+ALL_LIST=$ALL_LIST
+EXPORT_LIST=$EXPORT_LIST
+SKIP_LIST=$SKIP_LIST
+LOG=$LOG
+DRY_RUN=$DRY_RUN
+EOF
+}
+
+if [[ "$PRINT_CONFIG" == true ]]; then
+  print_config
+  exit 0
+fi
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "缺少必要命令：$1" >&2
+    exit 127
+  }
+}
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG"
+}
+
+log_only() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
+}
+
+step_done() {
+  local message="$1"
+  if [[ -n "${LOG:-}" ]]; then
+    log "步骤完成：$message"
+  else
+    echo "步骤完成：$message"
+  fi
+}
+
+progress_bar() {
+  local current="$1"
+  local total="$2"
+  local width=28
+  local percent=0
+  local filled=0
+  local empty=0
+  local bar=""
+  local i
+
+  if (( total > 0 )); then
+    percent=$((current * 100 / total))
+  fi
+  (( percent > 100 )) && percent=100
+  filled=$((percent * width / 100))
+  empty=$((width - filled))
+
+  for ((i = 0; i < filled; i++)); do
+    bar+="█"
+  done
+  for ((i = 0; i < empty; i++)); do
+    bar+="░"
+  done
+  printf '%s' "$bar"
+}
+
+render_export_progress() {
+  local current="$1"
+  local total="$2"
+  local stage="$3"
+  local detail_label="$4"
+  local detail="$5"
+  local percent=0
+  local bar
+
+  progress_rewind
+
+  if (( total > 0 )); then
+    percent=$((current * 100 / total))
+  fi
+  (( percent > 100 )) && percent=100
+  bar="$(progress_bar "$current" "$total")"
+
+  printf '%b\n' "${C_CYAN}┌─ 导出进度${C_RESET}"
+  printf '  %b[%s]%b %3d%%  %d/%d\n' "$C_CYAN" "$bar" "$C_RESET" "$percent" "$current" "$total"
+  printf '  阶段：%s\n' "$stage"
+  printf '  当前%s：%s\n' "$detail_label" "$detail"
+  printf '%b\n' "${C_CYAN}└────────────────────────────────────────${C_RESET}"
+
+  progress_mark_rendered 5
+}
+
+progress_can_refresh() {
+  [[ -t 1 ]] || [[ "${BY2_FORCE_TTY_PROGRESS:-false}" == true ]]
+}
+
+progress_rewind() {
+  if [[ "${BY2_PROGRESS_RENDERED:-false}" == true ]] && progress_can_refresh; then
+    printf '\033[%sA' "${BY2_PROGRESS_LINES:-5}"
+  fi
+}
+
+progress_mark_rendered() {
+  local lines="$1"
+  if progress_can_refresh; then
+    printf '\033[J'
+    BY2_PROGRESS_RENDERED=true
+    BY2_PROGRESS_LINES="$lines"
+  fi
+}
+
+format_elapsed() {
+  local start="$1"
+  local now
+  local elapsed
+  now=$(date +%s)
+  elapsed=$((now - start))
+  printf '%02d:%02d:%02d' "$((elapsed / 3600))" "$(((elapsed % 3600) / 60))" "$((elapsed % 60))"
+}
+
+human_file_size() {
+  local file="$1"
+  local bytes=0
+  if [[ -e "$file" ]]; then
+    bytes=$(stat -c '%s' "$file" 2>/dev/null || echo 0)
+  fi
+  awk -v bytes="$bytes" 'BEGIN {
+    split("B KiB MiB GiB TiB", unit)
+    size = bytes + 0
+    idx = 1
+    while (size >= 1024 && idx < 5) {
+      size = size / 1024
+      idx++
+    }
+    if (idx == 1) {
+      printf "%d%s", size, unit[idx]
+    } else {
+      printf "%.2f%s", size, unit[idx]
+    }
+  }'
+}
+
+render_packaging_progress() {
+  local out_file="$1"
+  local signal="$2"
+  local start_time="$3"
+  local elapsed
+  local size
+
+  elapsed="$(format_elapsed "$start_time")"
+  size="$(human_file_size "$out_file")"
+  progress_rewind
+  printf '%b\n' "${C_CYAN}┌─ 生成镜像包中 ${signal}${C_RESET}"
+  printf '  输出文件：%s\n' "$out_file"
+  printf '  已耗时：%s\n' "$elapsed"
+  printf '  当前大小：%s\n' "$size"
+  printf '  状态：docker save 正在写入镜像包，请勿关闭终端\n'
+  printf '%b\n' "${C_CYAN}└────────────────────────────────────────${C_RESET}"
+  progress_mark_rendered 6
+}
+
+save_images_with_progress() {
+  local out_file="$1"
+  shift
+  local start_time
+  local pid
+  local rc=0
+  local spin='|/-\'
+  local index=0
+  local signal
+
+  start_time="$(date +%s)"
+  signal="${spin:$((index % 4)):1}"
+  render_packaging_progress "$out_file" "$signal" "$start_time"
+  log_only "saving $out_file"
+
+  docker save "$@" -o "$out_file" >> "$LOG" 2>&1 &
+  pid=$!
+
+  while kill -0 "$pid" 2>/dev/null; do
+    index=$((index + 1))
+    signal="${spin:$((index % 4)):1}"
+    if progress_can_refresh; then
+      render_packaging_progress "$out_file" "$signal" "$start_time"
+    fi
+    sleep 1
+  done
+
+  if wait "$pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  render_packaging_progress "$out_file" "OK" "$start_time"
+  return "$rc"
+}
+
+append_skip() {
+  local image="$1"
+  local reason="$2"
+  printf '%s | skipped: %s\n' "$image" "$reason" | tee -a "$SKIP_LIST" "$LOG" >/dev/null
+}
+
+platform_of_image() {
+  docker image inspect "$1" --format '{{.Os}}/{{.Architecture}}{{if .Variant}}/{{.Variant}}{{end}}'
+}
+
+platform_matches() {
+  local actual="$1"
+  local expected="$2"
+
+  [[ "$actual" == "$expected" ]] && return 0
+
+  # Docker 有时只显示 linux/arm64，而 Harbor 页面可能显示 linux/arm64/v8；这两种按 ARM64 兼容处理。
+  if [[ "$expected" == "linux/arm64" && "$actual" == "linux/arm64/v8" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+is_registry_image() {
+  local image="$1"
+
+  # 设置了仓库前缀时，只处理该前缀下的镜像。
+  if [[ -n "$REGISTRY_PREFIX" ]]; then
+    [[ "$image" == "$REGISTRY_PREFIX"* ]]
+    return
+  fi
+
+  # 没有仓库前缀时，处理所有带 / 的镜像；tmp-base:1.0.0 这类本地短名仍然跳过。
+  [[ "$image" == */* ]]
+}
+
+restore_tags() {
+  [[ "$RESTORE_AFTER_EXPORT" == true ]] || return 0
+  [[ "$DRY_RUN" == false ]] || return 0
+  [[ -s "$EXPORT_LIST" ]] || return 0
+
+  local restore_total
+  local restore_current=0
+  restore_total=$(wc -l < "$EXPORT_LIST" | tr -d ' ')
+  log "restoring exported image tags to $RESTORE_PLATFORM"
+  while IFS= read -r image; do
+    [[ -n "$image" ]] || continue
+    restore_current=$((restore_current + 1))
+    render_export_progress "$restore_current" "$restore_total" "恢复本机镜像：$RESTORE_PLATFORM" "镜像" "$image"
+    log_only "restore $image"
+    if ! docker pull --platform "$RESTORE_PLATFORM" "$image" >> "$LOG" 2>&1; then
+      log_only "restore_failed $image"
+    fi
+  done < "$EXPORT_LIST"
+  step_done "本次导出镜像架构恢复流程结束：$RESTORE_PLATFORM"
+}
+
+export_images() {
+  require_cmd docker
+  require_cmd awk
+  require_cmd sort
+  require_cmd tee
+
+  cd "$WORKDIR"
+
+  : > "$LOG"
+  : > "$EXPORT_LIST"
+  : > "$SKIP_LIST"
+
+  log "effective config:"
+  print_config | tee -a "$LOG"
+
+  if [[ -n "$IMAGE_LIST" ]]; then
+    log "using image list: $IMAGE_LIST"
+    sort -u "$IMAGE_LIST" > "$ALL_LIST"
+  else
+    log "generating image list from docker compose config"
+    docker compose config | awk '/image:/ {print $2}' | sort -u > "$ALL_LIST"
+  fi
+
+  local total
+  total=$(wc -l < "$ALL_LIST" | tr -d ' ')
+  log "image count: $total"
+  step_done "镜像列表已生成，共 $total 个镜像"
+
+  local candidates=()
+  while IFS= read -r image; do
+    [[ -n "$image" ]] || continue
+
+    if ! is_registry_image "$image"; then
+      append_skip "$image" "not matched by REGISTRY_PREFIX or local short-name image"
+      continue
+    fi
+
+    candidates+=("$image")
+  done < "$ALL_LIST"
+
+  local candidate_total=${#candidates[@]}
+  local current=0
+  log_only "matched image count: $candidate_total"
+
+  for image in "${candidates[@]}"; do
+    current=$((current + 1))
+
+    if [[ "$DRY_RUN" == true ]]; then
+      render_export_progress "$current" "$candidate_total" "预演导出：$PLATFORM" "镜像" "$image"
+      log_only "dry-run would export $image as $PLATFORM"
+      printf '%s\n' "$image" >> "$EXPORT_LIST"
+      continue
+    fi
+
+    render_export_progress "$current" "$candidate_total" "拉取镜像：$PLATFORM" "镜像" "$image"
+    log_only "pull $image as $PLATFORM"
+    if docker pull --platform "$PLATFORM" "$image" >> "$LOG" 2>&1; then
+      local actual
+      actual=$(platform_of_image "$image" 2>/dev/null || true)
+      if platform_matches "$actual" "$PLATFORM"; then
+        printf '%s\n' "$image" >> "$EXPORT_LIST"
+        log_only "ok $image => $actual"
+      else
+        append_skip "$image" "pulled platform is ${actual:-unknown}, expected $PLATFORM"
+      fi
+    else
+      append_skip "$image" "docker pull --platform $PLATFORM failed"
+    fi
+  done
+
+  local export_count
+  export_count=$(wc -l < "$EXPORT_LIST" | tr -d ' ')
+
+  if [[ "$DRY_RUN" == true ]]; then
+    log "candidate image count: $export_count"
+    log "dry-run complete; no image was pulled or saved"
+    step_done "预演完成，未拉取镜像，未生成 tar"
+    return 0
+  fi
+
+  log_only "exportable image count: $export_count"
+
+  if [[ "$export_count" -eq 0 ]]; then
+    log "no exportable images"
+    return 2
+  fi
+
+  mapfile -t images_to_save < "$EXPORT_LIST"
+  rm -f "$OUT"
+  if ! save_images_with_progress "$OUT" "${images_to_save[@]}"; then
+    log "docker save failed: $OUT"
+    return 2
+  fi
+  ls -lh "$OUT" >> "$LOG" 2>&1
+  step_done "镜像包已生成：$OUT"
+  restore_tags
+  log_only "done"
+}
+
+
+safe_image_name() {
+  local image="$1"
+  image="${image//\//_}"
+  image="${image//:/_}"
+  image="${image//@/_}"
+  printf '%s' "$image"
+}
+
+export_one_image() {
+  require_cmd docker
+  require_cmd awk
+  require_cmd tee
+
+  cd "$WORKDIR"
+
+  if [[ -z "$SINGLE_IMAGE" ]]; then
+    echo "未指定 SINGLE_IMAGE。请使用 --image，或在交互菜单里选择/输入镜像。" >&2
+    return 64
+  fi
+
+  local safe_name
+  safe_name="$(safe_image_name "$SINGLE_IMAGE")"
+  OUT="${OUT:-single_${safe_name}_${PLATFORM_SUFFIX}.tar}"
+  EXPORT_LIST="${EXPORT_LIST:-single_${PLATFORM_SUFFIX}_export_images.list}"
+  SKIP_LIST="${SKIP_LIST:-single_${PLATFORM_SUFFIX}_skipped_images.list}"
+  LOG="${LOG:-single_${PLATFORM_SUFFIX}_export.log}"
+
+  : > "$LOG"
+  : > "$EXPORT_LIST"
+  : > "$SKIP_LIST"
+
+  log "effective config:"
+  print_config | tee -a "$LOG"
+
+  if ! is_registry_image "$SINGLE_IMAGE"; then
+    append_skip "$SINGLE_IMAGE" "not matched by REGISTRY_PREFIX or local short-name image"
+    step_done "单镜像检查完成：该镜像不匹配当前仓库前缀，未导出"
+    return 2
+  fi
+
+  if [[ "$DRY_RUN" == true ]]; then
+    render_export_progress 1 1 "单镜像预演：$PLATFORM" "镜像" "$SINGLE_IMAGE"
+    log_only "dry-run would export $SINGLE_IMAGE as $PLATFORM"
+    printf '%s\n' "$SINGLE_IMAGE" > "$EXPORT_LIST"
+    step_done "单镜像导出预演完成，未拉取镜像，未生成 tar"
+    return 0
+  fi
+
+  printf '%s\n' "$SINGLE_IMAGE" > "$ALL_LIST"
+
+  render_export_progress 1 1 "拉取单镜像：$PLATFORM" "镜像" "$SINGLE_IMAGE"
+  log_only "pull $SINGLE_IMAGE as $PLATFORM"
+  if docker pull --platform "$PLATFORM" "$SINGLE_IMAGE" >> "$LOG" 2>&1; then
+    local actual
+    actual=$(platform_of_image "$SINGLE_IMAGE" 2>/dev/null || true)
+    if platform_matches "$actual" "$PLATFORM"; then
+      printf '%s\n' "$SINGLE_IMAGE" > "$EXPORT_LIST"
+      log_only "ok $SINGLE_IMAGE => $actual"
+    else
+      append_skip "$SINGLE_IMAGE" "pulled platform is ${actual:-unknown}, expected $PLATFORM"
+      step_done "单镜像检查完成：平台不匹配，未导出"
+      return 2
+    fi
+  else
+    append_skip "$SINGLE_IMAGE" "docker pull --platform $PLATFORM failed"
+    step_done "单镜像拉取失败，未导出"
+    return 2
+  fi
+
+  rm -f "$OUT"
+  if ! save_images_with_progress "$OUT" "$SINGLE_IMAGE"; then
+    log "docker save failed: $OUT"
+    return 2
+  fi
+  ls -lh "$OUT" >> "$LOG" 2>&1
+  step_done "单镜像包已生成：$OUT"
+  restore_tags
+}
+
+show_tar_tags() {
+  local tar_file="$1"
+  tar -xOf "$tar_file" repositories 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data=json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for repo, tags in data.items():
+    for tag in tags:
+        print(f"{repo}:{tag}")
+' || true
+}
+
+import_images() {
+  cd "$WORKDIR"
+
+  if [[ ! -f "$IMPORT_FILE" ]]; then
+    echo "导入文件不存在：$IMPORT_FILE" >&2
+    return 66
+  fi
+
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "dry-run would load $IMPORT_FILE"
+    if [[ "$SHOW_IMAGES_AFTER_IMPORT" == true ]]; then
+      show_tar_tags "$IMPORT_FILE" || true
+    fi
+    if [[ "$RUN_COMPOSE_UP" == true ]]; then
+      echo "dry-run would run docker compose up -d in $WORKDIR"
+    fi
+    echo "步骤完成：导入预演完成，未执行 docker load"
+    return 0
+  fi
+
+  require_cmd docker
+  echo "开始导入镜像包：$IMPORT_FILE"
+  docker load -i "$IMPORT_FILE"
+  echo "步骤完成：镜像包已导入：$IMPORT_FILE"
+
+  if [[ "$SHOW_IMAGES_AFTER_IMPORT" == true ]]; then
+    echo "导入包包含的 tag："
+    show_tar_tags "$IMPORT_FILE" || true
+  fi
+
+  if [[ "$RUN_COMPOSE_UP" == true ]]; then
+    echo "执行 docker compose up -d"
+    docker compose up -d
+  fi
+}
+
+status_line() {
+  local label="$1"
+  local state="$2"
+  local detail="$3"
+  printf '  %-22s [%s] %s\n' "$label" "$state" "$detail"
+}
+
+check_environment() {
+  echo "环境检查"
+  echo "----------------------------------------"
+  echo "工具信息"
+  status_line "工具名称" "OK" "$SCRIPT_TITLE"
+  status_line "脚本名称" "OK" "$SCRIPT_NAME"
+  status_line "当前版本" "OK" "$SCRIPT_VERSION"
+  status_line "目标架构" "OK" "$PLATFORM"
+  echo
+
+  echo "运行环境"
+  if command -v docker >/dev/null 2>&1; then
+    status_line "Docker 客户端" "OK" "$(docker --version 2>/dev/null || echo '已安装')"
+  else
+    status_line "Docker 客户端" "MISS" "未检测到 docker 命令"
+  fi
+
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    status_line "Docker Compose" "OK" "$(docker compose version 2>/dev/null)"
+  else
+    status_line "Docker Compose" "MISS" "未检测到 docker compose"
+  fi
+  echo
+
+  echo "项目路径"
+  if [[ -d "$WORKDIR" ]]; then
+    status_line "工作目录" "OK" "$WORKDIR"
+  else
+    status_line "工作目录" "MISS" "$WORKDIR 不存在"
+  fi
+
+  if [[ -f "$WORKDIR/docker-compose.yml" ]]; then
+    status_line "docker-compose.yml" "OK" "$WORKDIR/docker-compose.yml"
+  elif [[ -f "$WORKDIR/compose.yml" ]]; then
+    status_line "docker-compose.yml" "OK" "$WORKDIR/compose.yml"
+  else
+    status_line "docker-compose.yml" "MISS" "未找到 compose 文件"
+  fi
+  echo
+
+  echo "镜像迁移"
+  if [[ -d "$WORKDIR" ]]; then
+    local tar_count
+    tar_count=$(find "$WORKDIR" -maxdepth 1 -type f -name '*.tar' 2>/dev/null | wc -l | tr -d ' ')
+    status_line "镜像包文件" "OK" "${tar_count} 个 tar 文件"
+
+    if command -v docker >/dev/null 2>&1 && [[ -f "$WORKDIR/docker-compose.yml" || -f "$WORKDIR/compose.yml" ]]; then
+      local image_count
+      image_count=$(cd "$WORKDIR" && docker compose config 2>/dev/null | awk '/image:/ {print $2}' | sort -u | wc -l | tr -d ' ')
+      status_line "Compose 镜像数量" "OK" "${image_count} 个"
+    else
+      status_line "Compose 镜像数量" "SKIP" "缺少 docker compose 或 compose 文件"
+    fi
+  else
+    status_line "镜像包文件" "SKIP" "工作目录不存在"
+    status_line "Compose 镜像数量" "SKIP" "工作目录不存在"
+  fi
+
+  echo "步骤完成：环境检查完成"
+}
+
+compose_file_ready() {
+  [[ -f "$WORKDIR/docker-compose.yml" || -f "$WORKDIR/compose.yml" ]]
+}
+
+show_service_status() {
+  echo "服务状态"
+  echo "----------------------------------------"
+  echo "工作目录：$WORKDIR"
+  echo "执行命令：docker compose ps"
+
+  if [[ ! -d "$WORKDIR" ]]; then
+    echo "工作目录不存在：$WORKDIR" >&2
+    return 66
+  fi
+
+  if ! compose_file_ready; then
+    echo "未找到 docker-compose.yml 或 compose.yml" >&2
+    return 66
+  fi
+
+  require_cmd docker
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "dry-run would run docker compose ps in $WORKDIR"
+    echo "步骤完成：服务状态查看完成"
+    return 0
+  fi
+
+  (cd "$WORKDIR" && docker compose ps)
+  echo "步骤完成：服务状态查看完成"
+}
+
+run_service_action() {
+  local action="$1"
+  local command_text="$2"
+
+  echo "服务启停"
+  echo "----------------------------------------"
+  echo "工作目录：$WORKDIR"
+  echo "执行动作：$action"
+  echo "执行命令：$command_text"
+
+  if [[ ! -d "$WORKDIR" ]]; then
+    echo "工作目录不存在：$WORKDIR" >&2
+    return 66
+  fi
+
+  if ! compose_file_ready; then
+    echo "未找到 docker-compose.yml 或 compose.yml" >&2
+    return 66
+  fi
+
+  require_cmd docker
+  if [[ "$DRY_RUN" == true ]]; then
+    echo "dry-run would run $command_text in $WORKDIR"
+    echo "步骤完成：服务${action}预演完成"
+    return 0
+  fi
+
+  (cd "$WORKDIR" && eval "$command_text")
+  echo "步骤完成：服务${action}完成"
+}
+
+self_update() {
+  if [[ -z "$UPDATE_SOURCE" ]]; then
+    echo "未配置 UPDATE_SOURCE，无法自动更新。"
+    echo "可以在脚本顶部设置 UPDATE_SOURCE，或执行：$0 --mode update --update-source <URL或文件路径>"
+    echo "步骤完成：更新检查结束，未执行更新"
+    return 2
+  fi
+
+  local self tmp backup
+  self="$(readlink -f "$0")"
+  tmp="$(mktemp)"
+  backup="${self}.bak.$(date +%Y%m%d%H%M%S)"
+
+  echo "更新源：$UPDATE_SOURCE"
+  case "$UPDATE_SOURCE" in
+    http://*|https://*)
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$UPDATE_SOURCE" -o "$tmp"
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp" "$UPDATE_SOURCE"
+      else
+        echo "缺少 curl 或 wget，无法从 URL 更新。" >&2
+        rm -f "$tmp"
+        return 127
+      fi
+      ;;
+    *)
+      if [[ ! -f "$UPDATE_SOURCE" ]]; then
+        echo "更新源文件不存在：$UPDATE_SOURCE" >&2
+        rm -f "$tmp"
+        return 66
+      fi
+      cp "$UPDATE_SOURCE" "$tmp"
+      ;;
+  esac
+
+  if ! bash -n "$tmp"; then
+    echo "新脚本语法检查失败，已取消更新。" >&2
+    rm -f "$tmp"
+    return 65
+  fi
+
+  cp "$self" "$backup"
+  cp "$tmp" "$self"
+  chmod +x "$self"
+  rm -f "$tmp"
+  echo "脚本已更新，备份文件：$backup"
+  echo "步骤完成：脚本更新完成"
+}
+
+ask() {
+  local prompt="$1"
+  local default="$2"
+  local value
+  if [[ -n "$default" ]]; then
+    printf '%s [%s]: ' "$prompt" "$default" >&2
+  else
+    printf '%s: ' "$prompt" >&2
+  fi
+  if ! IFS= read -r value; then
+    echo
+    return 1
+  fi
+  printf '%s' "${value:-$default}"
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local default="$2"
+  local answer
+  while true; do
+    answer="$(ask "$prompt" "$default")" || return 1
+    case "${answer,,}" in
+      y|yes|是|true) return 0 ;;
+      n|no|否|false) return 1 ;;
+      *) echo "请输入 y 或 n" ;;
+    esac
+  done
+}
+
+pause_before_menu() {
+  local message="${1:-按回车返回菜单}"
+  local _
+  printf '%s' "$message" >&2
+  IFS= read -r _ || true
+}
+
+
+
+center_text_line() {
+  local width="$1"
+  local text="$2"
+  local len=${#text}
+  local pad=0
+  if (( width > len )); then
+    pad=$(((width - len) / 2))
+  fi
+  printf '%*s%s\n' "$pad" '' "$text"
+}
+
+border_text_line() {
+  local width="$1"
+  local text="$2"
+  local len=${#text}
+  local left=0
+  local right=0
+  if (( width > len )); then
+    left=$(((width - len) / 2))
+    right=$((width - len - left))
+  fi
+  printf '%b║%*s%s%*s║%b\n' "$C_CYAN" "$left" '' "$text" "$right" '' "$C_RESET"
+}
+
+border_blank_line() {
+  local width="$1"
+  printf '%b║%*s║%b\n' "$C_CYAN" "$width" '' "$C_RESET"
+}
+
+render_product_logo() {
+  local width=68
+  border_text_line "$width" '    ______  _____  ______            __'
+  border_text_line "$width" '   / __ ) \/ /__ \/_  __/___  ____  / /'
+  border_text_line "$width" '  / __  |\  /__/ / / / / __ \/ __ \/ / '
+  border_text_line "$width" ' / /_/ / / // __/ / / / /_/ / /_/ / /  '
+  border_text_line "$width" '/_____/ /_//____//_/  \____/\____/_/   '
+}
+
+render_banner() {
+  local width=68
+  printf '%b
+' "${C_CYAN}╔════════════════════════════════════════════════════════════════════╗${C_RESET}"
+  border_text_line "$width" "$SCRIPT_NAME  Copyright: $SCRIPT_OWNER  Version: $SCRIPT_VERSION"
+  printf '%b
+' "${C_CYAN}╠════════════════════════════════════════════════════════════════════╣${C_RESET}"
+  border_blank_line "$width"
+  printf '%b' "$C_BOLD"
+  render_product_logo
+  printf '%b' "$C_RESET"
+  border_blank_line "$width"
+  printf '%b
+' "${C_CYAN}╚════════════════════════════════════════════════════════════════════╝${C_RESET}"
+}
+
+plain_select_menu() {
+  local title="$1"
+  shift
+  local options=("$@")
+  local choice
+
+  center_text_line 68 "$title" >&2
+  local i
+  for i in "${!options[@]}"; do
+    printf '  %d) %s\n' "$((i + 1))" "${options[$i]}" >&2
+  done
+
+  while true; do
+    choice="$(ask "请选择" "1")" || return 1
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
+      printf '%s' "$choice"
+      return 0
+    fi
+    if [[ "${choice,,}" == "q" ]]; then
+      printf '%s' "${#options[@]}"
+      return 0
+    fi
+    echo "无效选择" >&2
+  done
+}
+
+cursor_select_menu() {
+  local title="$1"
+  shift
+  local options=("$@")
+  local selected=0
+  local key
+
+  exec 3</dev/tty 4>/dev/tty
+  tput civis >&4 2>/dev/null || true
+  trap 'tput cnorm >&4 2>/dev/null || true; exec 3<&- 4>&-; trap - RETURN' RETURN
+
+  printf '%b\n' "$C_BOLD" >&4
+  center_text_line 68 "$title" >&4
+  printf '%b' "$C_RESET" >&4
+  printf '%s↑/↓ 选择，Enter 确认，q 退出%s\n\n' "$C_DIM" "$C_RESET" >&4
+
+  render_cursor_options() {
+    local i
+    for i in "${!options[@]}"; do
+      printf '\r\033[2K' >&4
+      if (( i == selected )); then
+        printf '  %s> %s%s\n' "$C_REVERSE" "${options[$i]}" "$C_RESET" >&4
+      else
+        printf '    %s\n' "${options[$i]}" >&4
+      fi
+    done
+  }
+
+  render_cursor_options
+
+  while true; do
+    IFS= read -rsn1 key <&3 || return 1
+    case "$key" in
+      $'\x1b')
+        IFS= read -rsn2 -t 0.1 key <&3 || { printf '%s' "${#options[@]}"; return 0; }
+        case "$key" in
+          '[A') ((selected--)); (( selected < 0 )) && selected=$((${#options[@]} - 1)) ;;
+          '[B') ((selected++)); (( selected >= ${#options[@]} )) && selected=0 ;;
+        esac
+        printf '\033[%sA' "${#options[@]}" >&4
+        render_cursor_options
+        ;;
+      '')
+        printf '\n' >&4
+        printf '%s' "$((selected + 1))"
+        return 0
+        ;;
+      q|Q)
+        printf '\n' >&4
+        printf '%s' "${#options[@]}"
+        return 0
+        ;;
+    esac
+  done
+}
+
+select_menu() {
+  local title="$1"
+  shift
+  if [[ -t 0 && -r /dev/tty && -w /dev/tty ]]; then
+    cursor_select_menu "$title" "$@"
+  else
+    plain_select_menu "$title" "$@"
+  fi
+}
+
+choose_platform() {
+  local choice
+  choice="$(select_menu "请选择目标架构" \
+    "linux/amd64    x86 默认" \
+    "linux/arm64    ARM64" \
+    "linux/arm/v7   32位 ARM" \
+    "手动输入")" || return 1
+
+  case "$choice" in
+    1) PLATFORM="linux/amd64" ;;
+    2) PLATFORM="linux/arm64" ;;
+    3) PLATFORM="linux/arm/v7" ;;
+    4) PLATFORM="$(ask "请输入平台" "$PLATFORM")" || return 1 ;;
+    *) PLATFORM="linux/amd64" ;;
+  esac
+  reset_platform_derived_names
+}
+
+choose_export_scope() {
+  local choice
+  choice="$(select_menu "选择导出范围" \
+    "Compose 中全部 Harbor 镜像：harbor.kocel.com:8082/*" \
+    "Ktmp 项目镜像：harbor.kocel.com:8082/ktmp/*" \
+    "自定义仓库/项目路径前缀" \
+    "处理所有带 / 的镜像" \
+    "返回上级")" || return 1
+
+  case "$choice" in
+    1) REGISTRY_PREFIX="harbor.kocel.com:8082/" ;;
+    2) REGISTRY_PREFIX="harbor.kocel.com:8082/ktmp/" ;;
+    3)
+      REGISTRY_PREFIX="$(ask "请输入导出前缀，例如 harbor.kocel.com:8082/ktmp/*" "$REGISTRY_PREFIX")" || return 1
+      REGISTRY_PREFIX="$(normalize_registry_prefix "$REGISTRY_PREFIX")"
+      ;;
+    4) REGISTRY_PREFIX="" ;;
+    5) return 1 ;;
+    *) REGISTRY_PREFIX="harbor.kocel.com:8082/" ;;
+  esac
+}
+
+interactive_export() {
+  MODE="export"
+  WORKDIR="$(ask "请输入工作目录" "$WORKDIR")" || return 1
+  choose_platform || return 1
+  choose_export_scope || {
+    echo "步骤完成：已返回镜像迁移菜单"
+    return 0
+  }
+  OUT="$(ask "请输入导出文件名" "$OUT")" || return 1
+  if ask_yes_no "是否只预演 dry-run" "n"; then DRY_RUN=true; else DRY_RUN=false; fi
+  if ask_yes_no "导出后是否恢复本机为 $RESTORE_PLATFORM" "n"; then RESTORE_AFTER_EXPORT=true; else RESTORE_AFTER_EXPORT=false; fi
+  echo
+  echo "即将导出："
+  print_config
+  echo
+  local rc=0
+  if ask_yes_no "确认开始导出" "y"; then
+    export_images || rc=$?
+    if (( rc != 0 )); then
+      echo "导出执行结束，退出码：$rc"
+    fi
+  else
+    echo "已取消导出"
+  fi
+  pause_before_menu "导出流程已结束，按回车返回菜单"
+}
+
+
+load_compose_images_for_menu() {
+  cd "$WORKDIR"
+  docker compose config 2>/dev/null | awk '/image:/ {print $2}' | sort -u
+}
+
+interactive_export_one() {
+  MODE="export-one"
+  WORKDIR="$(ask "请输入工作目录" "$WORKDIR")" || return 1
+  choose_platform || return 1
+
+  local images=()
+  local selected
+  mapfile -t images < <(load_compose_images_for_menu || true)
+  images+=("手动输入镜像名")
+
+  selected="$(select_menu "请选择要导出的单个镜像" "${images[@]}")" || return 1
+  if [[ "$selected" =~ ^[0-9]+$ ]] && (( selected >= 1 && selected < ${#images[@]} )); then
+    SINGLE_IMAGE="${images[$((selected - 1))]}"
+  else
+    SINGLE_IMAGE="$(ask "请输入完整镜像名" "$SINGLE_IMAGE")" || return 1
+  fi
+
+  local safe_name
+  safe_name="$(safe_image_name "$SINGLE_IMAGE")"
+  OUT="single_${safe_name}_${PLATFORM_SUFFIX}.tar"
+  OUT="$(ask "请输入导出文件名" "$OUT")" || return 1
+  if ask_yes_no "是否只预演 dry-run" "n"; then DRY_RUN=true; else DRY_RUN=false; fi
+  if ask_yes_no "导出后是否恢复本机为 $RESTORE_PLATFORM" "n"; then RESTORE_AFTER_EXPORT=true; else RESTORE_AFTER_EXPORT=false; fi
+  echo
+  echo "即将导出单个镜像："
+  print_config
+  echo
+  local rc=0
+  if ask_yes_no "确认开始导出" "y"; then
+    export_one_image || rc=$?
+    if (( rc != 0 )); then
+      echo "导出执行结束，退出码：$rc"
+    fi
+  else
+    echo "已取消导出"
+  fi
+  pause_before_menu "导出流程已结束，按回车返回菜单"
+}
+
+interactive_import() {
+  MODE="import"
+  WORKDIR="$(ask "请输入工作目录" "$WORKDIR")" || return 1
+  IMPORT_FILE="$(ask "请输入要导入的 tar 文件" "$IMPORT_FILE")" || return 1
+  if ask_yes_no "是否只预演 dry-run" "n"; then DRY_RUN=true; else DRY_RUN=false; fi
+  if ask_yes_no "导入后是否显示镜像 tag" "y"; then SHOW_IMAGES_AFTER_IMPORT=true; else SHOW_IMAGES_AFTER_IMPORT=false; fi
+  if ask_yes_no "导入后是否执行 docker compose up -d" "n"; then RUN_COMPOSE_UP=true; else RUN_COMPOSE_UP=false; fi
+  echo
+  echo "即将导入："
+  print_config
+  echo
+  ask_yes_no "确认开始导入" "y" && import_images || echo "已取消导入"
+}
+
+show_system_info() {
+  echo "系统信息："
+  echo "  工具名称：$SCRIPT_TITLE"
+  echo "  脚本名称：$SCRIPT_NAME"
+  echo "  当前版本：$SCRIPT_VERSION"
+  echo "  工作目录：$WORKDIR"
+  echo "  默认架构：$PLATFORM"
+  echo "  Docker：$(docker --version 2>/dev/null || echo '未检测到 docker')"
+  echo "步骤完成：系统信息展示完成"
+}
+
+planned_feature() {
+  local name="$1"
+  echo "$name：该模块已预留，将在后续版本迭代。"
+  echo "步骤完成：$name 模块入口展示完成"
+}
+
+interactive_image_migration_menu() {
+  while true; do
+    render_banner
+    local choice
+    choice="$(select_menu "镜像迁移中心" \
+      "导出全部镜像包" \
+      "导出单个镜像" \
+      "导入镜像包" \
+      "查看镜像迁移配置" \
+      "返回主菜单")" || return 0
+    case "$choice" in
+      1) interactive_export ;;
+      2) interactive_export_one ;;
+      3) interactive_import ;;
+      4) echo "当前镜像迁移配置："; print_config ;;
+      5) return 0 ;;
+      *) echo "无效选择" ;;
+    esac
+  done
+}
+
+interactive_service_menu() {
+  while true; do
+    render_banner
+    local choice
+    choice="$(select_menu "服务启停" \
+      "查看服务状态" \
+      "启动服务" \
+      "停止服务" \
+      "重启服务" \
+      "返回主菜单")" || return 0
+    case "$choice" in
+      1) show_service_status ;;
+      2) ask_yes_no "确认执行 docker compose up -d" "n" && run_service_action "启动" "docker compose up -d" || echo "已取消启动" ;;
+      3) ask_yes_no "确认执行 docker compose stop" "n" && run_service_action "停止" "docker compose stop" || echo "已取消停止" ;;
+      4) ask_yes_no "确认执行 docker compose restart" "n" && run_service_action "重启" "docker compose restart" || echo "已取消重启" ;;
+      5) return 0 ;;
+      *) echo "无效选择" ;;
+    esac
+  done
+}
+
+interactive_menu() {
+  while true; do
+    render_banner
+    local choice
+    choice="$(select_menu "$SCRIPT_TITLE" \
+      "镜像迁移中心" \
+      "环境检查" \
+      "服务启停" \
+      "备份恢复" \
+      "工具更新" \
+      "系统信息" \
+      "退出")" || return 0
+    case "$choice" in
+      1) interactive_image_migration_menu ;;
+      2) check_environment ;;
+      3) interactive_service_menu ;;
+      4) planned_feature "备份恢复" ;;
+      5) self_update || true ;;
+      6) show_system_info ;;
+      7) echo "已退出"; return 0 ;;
+      *) echo "无效选择" ;;
+    esac
+  done
+}
+
+case "$MODE" in
+  menu) interactive_menu ;;
+  export) export_images ;;
+  export-one) export_one_image ;;
+  import) import_images ;;
+  check) check_environment ;;
+  service-status) show_service_status ;;
+  update) self_update ;;
+  *) echo "未知 MODE：$MODE" >&2; usage >&2; exit 64 ;;
+esac
