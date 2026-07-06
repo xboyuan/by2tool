@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v1.4.3"
+SCRIPT_VERSION="v1.4.4"
 SCRIPT_NAME="by2tool"
 SCRIPT_OWNER="BoYuan"
 SCRIPT_TITLE="BoYuan运维工具箱"
@@ -744,9 +744,23 @@ export_one_image() {
       return 2
     fi
   else
-    append_skip "$SINGLE_IMAGE" "docker pull --platform $PLATFORM failed"
-    step_done "单镜像拉取失败，未导出"
-    return 2
+    local actual
+    log_only "pull failed; checking local image $SINGLE_IMAGE"
+    actual=$(platform_of_image "$SINGLE_IMAGE" 2>/dev/null || true)
+    if [[ -z "$actual" ]]; then
+      append_skip "$SINGLE_IMAGE" "docker pull --platform $PLATFORM failed and local image was not found"
+      step_done "单镜像拉取失败，且本地未找到该镜像，未导出"
+      return 2
+    fi
+    if platform_matches "$actual" "$PLATFORM"; then
+      printf '%s\n' "$SINGLE_IMAGE" > "$EXPORT_LIST"
+      log_only "local fallback ok $SINGLE_IMAGE => $actual"
+      step_done "远端拉取失败，已使用本地已有镜像继续导出：$actual"
+    else
+      append_skip "$SINGLE_IMAGE" "docker pull --platform $PLATFORM failed; local platform is ${actual:-unknown}, expected $PLATFORM"
+      step_done "单镜像拉取失败；本地镜像平台为 ${actual:-unknown}，不匹配 $PLATFORM，未导出"
+      return 2
+    fi
   fi
 
   rm -f "$OUT"
