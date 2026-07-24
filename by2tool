@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="v1.4.6"
+SCRIPT_VERSION="v1.5.0"
 SCRIPT_NAME="by2tool"
 SCRIPT_OWNER="BoYuan"
 SCRIPT_TITLE="BoYuan运维工具箱"
@@ -41,6 +41,10 @@ SINGLE_IMAGE="${SINGLE_IMAGE:-}"
 # 批量导出时只处理这个仓库前缀下的镜像；单镜像导出以用户输入为准，不受此前缀限制。
 # 如果批量导出希望处理所有带 / 的镜像，把它设置为空：REGISTRY_PREFIX=""
 REGISTRY_PREFIX="${REGISTRY_PREFIX:-harbor.kocel.com:8082/}"
+
+# 批量导出时需要排除的镜像规则，支持精确镜像名和 * 通配符；多个规则用逗号分隔。
+# 例如：EXCLUDE_IMAGES="harbor.kocel.com:8082/ktmp/tmp-ai:1.0.0,harbor.kocel.com:8082/legacy/*"
+EXCLUDE_IMAGES="${EXCLUDE_IMAGES:-}"
 
 # true：导出成功后，只恢复本次实际导出的镜像；默认不恢复，避免额外改动本机镜像。
 RESTORE_AFTER_EXPORT="${RESTORE_AFTER_EXPORT:-false}"
@@ -121,10 +125,11 @@ BoYuan运维工具箱采用单脚本交付，当前功能集中在“镜像迁�
   ./by2tool --mode service-status
   ./by2tool --mode export --dry-run
   ./by2tool --mode export --registry-prefix 'harbor.kocel.com:8082/*'
+  ./by2tool --mode export --exclude-image 'harbor.kocel.com:8082/ktmp/tmp-ai:1.0.0'
   ./by2tool --mode export --registry-prefix 'harbor.kocel.com:8082/ktmp/*'
 
 功能模块：
-  镜像迁移中心          导出全部镜像、导出单个镜像、导入镜像包
+  镜像迁移中心          批量导出、多选导出、单个导出、导入镜像包
   导出范围              支持 Harbor 全仓库、项目路径前缀、自定义前缀筛选
   环境检查              检查 Docker、Compose、工作目录、compose 文件和镜像包
   服务启停              查看服务状态，带确认地执行启动、停止、重启
@@ -140,6 +145,7 @@ BoYuan运维工具箱采用单脚本交付，当前功能集中在“镜像迁�
   --in FILE                导入的 docker save tar 文件；不指定则默认使用 OUT
   --image IMAGE            只导出单个镜像时使用的镜像名
   --registry-prefix PREFIX 只处理指定仓库前缀；传空字符串可处理所有带 / 的镜像
+  --exclude-image PATTERN  批量导出时排除镜像，支持 * 通配符；可重复使用
   --image-list FILE        使用指定镜像列表，不从 docker compose config 解析
   --restore                导出成功后恢复本次实际导出的镜像到 restore-platform
   --no-restore             导出后不恢复当前机器镜像架构
@@ -169,6 +175,11 @@ while [[ $# -gt 0 ]]; do
     --in) IMPORT_FILE="$2"; IMPORT_FILE_WAS_SET=true; shift 2 ;;
     --image) SINGLE_IMAGE="$2"; shift 2 ;;
     --registry-prefix) REGISTRY_PREFIX="$2"; shift 2 ;;
+    --exclude-image)
+      [[ -n "$EXCLUDE_IMAGES" ]] && EXCLUDE_IMAGES+=","
+      EXCLUDE_IMAGES+="$2"
+      shift 2
+      ;;
     --image-list) IMAGE_LIST="$2"; shift 2 ;;
     --restore) RESTORE_AFTER_EXPORT=true; shift ;;
     --no-restore) RESTORE_AFTER_EXPORT=false; shift ;;
@@ -220,6 +231,8 @@ apply_derived_defaults() {
   PLATFORM_SUFFIX="$(platform_suffix "$PLATFORM")"
   if [[ "$MODE" == "export-one" && -n "$SINGLE_IMAGE" && "$OUT_WAS_SET" != true ]]; then
     OUT="$(single_image_default_out "$SINGLE_IMAGE")"
+  elif [[ "$MODE" == "export-selected" && "$OUT_WAS_SET" != true ]]; then
+    OUT="${OUT:-selected_images_${PLATFORM_SUFFIX}.tar}"
   else
     OUT="${OUT:-support_all_images_${PLATFORM_SUFFIX}.tar}"
   fi
@@ -228,6 +241,10 @@ apply_derived_defaults() {
     EXPORT_LIST="${EXPORT_LIST:-single_${PLATFORM_SUFFIX}_export_images.list}"
     SKIP_LIST="${SKIP_LIST:-single_${PLATFORM_SUFFIX}_skipped_images.list}"
     LOG="${LOG:-single_${PLATFORM_SUFFIX}_export.log}"
+  elif [[ "$MODE" == "export-selected" ]]; then
+    EXPORT_LIST="${EXPORT_LIST:-selected_${PLATFORM_SUFFIX}_export_images.list}"
+    SKIP_LIST="${SKIP_LIST:-selected_${PLATFORM_SUFFIX}_skipped_images.list}"
+    LOG="${LOG:-selected_${PLATFORM_SUFFIX}_export.log}"
   else
     EXPORT_LIST="${EXPORT_LIST:-${PLATFORM_SUFFIX}_export_images.list}"
     SKIP_LIST="${SKIP_LIST:-${PLATFORM_SUFFIX}_skipped_images.list}"
@@ -262,6 +279,7 @@ EXPORT_ARCHIVE_FORMAT=$EXPORT_ARCHIVE_FORMAT
 IMPORT_FILE=$IMPORT_FILE
 SINGLE_IMAGE=$SINGLE_IMAGE
 REGISTRY_PREFIX=$REGISTRY_PREFIX
+EXCLUDE_IMAGES=$EXCLUDE_IMAGES
 RESTORE_AFTER_EXPORT=$RESTORE_AFTER_EXPORT
 SHOW_IMAGES_AFTER_IMPORT=$SHOW_IMAGES_AFTER_IMPORT
 RUN_COMPOSE_UP=$RUN_COMPOSE_UP
@@ -676,6 +694,11 @@ platform_matches() {
 is_registry_image() {
   local image="$1"
 
+  # 多选导出与单镜像导出语义一致，用户明确选中的 Compose 镜像不再受仓库前缀限制。
+  if [[ "$MODE" == "export-selected" ]]; then
+    return 0
+  fi
+
   # 设置了仓库前缀时，只处理该前缀下的镜像。
   if [[ -n "$REGISTRY_PREFIX" ]]; then
     [[ "$image" == "$REGISTRY_PREFIX"* ]]
@@ -686,9 +709,32 @@ is_registry_image() {
   [[ "$image" == */* ]]
 }
 
+is_excluded_image() {
+  local image="$1"
+  local pattern
+  local patterns="${EXCLUDE_IMAGES//,/$'\n'}"
+
+  while IFS= read -r pattern; do
+    pattern="${pattern#"${pattern%%[![:space:]]*}"}"
+    pattern="${pattern%"${pattern##*[![:space:]]}"}"
+    [[ -n "$pattern" ]] || continue
+
+    if [[ "$image" == $pattern ]]; then
+      return 0
+    fi
+  done <<< "$patterns"
+
+  return 1
+}
+
 describe_export_scope() {
   if [[ "$MODE" == "export-one" ]]; then
     printf '单个镜像，不使用仓库前缀过滤'
+    return
+  fi
+
+  if [[ "$MODE" == "export-selected" ]]; then
+    printf 'Compose 中手动勾选的镜像，不使用仓库前缀过滤'
     return
   fi
 
@@ -707,6 +753,8 @@ describe_export_scope() {
 describe_export_source() {
   if [[ "$MODE" == "export-one" ]]; then
     printf '%s' "$SINGLE_IMAGE"
+  elif [[ "$MODE" == "export-selected" ]]; then
+    printf 'docker compose config（用户多选）'
   elif [[ -n "$IMAGE_LIST" ]]; then
     printf '%s' "$IMAGE_LIST"
   else
@@ -741,6 +789,8 @@ render_export_confirmation() {
 
   if [[ "$MODE" == "export-one" ]]; then
     operation="单镜像导出"
+  elif [[ "$MODE" == "export-selected" ]]; then
+    operation="多选导出 Compose 镜像"
   else
     operation="批量导出 Compose 镜像"
   fi
@@ -754,6 +804,7 @@ render_export_confirmation() {
   printf '  操作：%s\n' "$operation"
   printf '  来源：%s\n' "$source"
   printf '  范围：%s\n' "$scope"
+  printf '  排除：%s\n' "${EXCLUDE_IMAGES:-无}"
   printf '  平台：%s\n' "$PLATFORM"
   printf '  输出：%s\n' "$OUT"
   printf '  执行：%s\n' "$action"
@@ -818,6 +869,11 @@ export_images() {
 
     if ! is_registry_image "$image"; then
       append_skip "$image" "not matched by REGISTRY_PREFIX or local short-name image"
+      continue
+    fi
+
+    if is_excluded_image "$image"; then
+      append_skip "$image" "matched EXCLUDE_IMAGES"
       continue
     fi
 
@@ -1555,6 +1611,138 @@ select_menu() {
   fi
 }
 
+plain_multi_select_menu() {
+  local title="$1"
+  shift
+  local options=("$@")
+  local input
+  local normalized
+  local value
+  local values=()
+  local seen=","
+
+  center_text_line 68 "$title" >&2
+  local i
+  for i in "${!options[@]}"; do
+    printf '  %d) %s\n' "$((i + 1))" "${options[$i]}" >&2
+  done
+
+  while true; do
+    input="$(ask "请输入序号，多个用逗号分隔，q 返回" "")" || return 1
+    [[ "${input,,}" == "q" ]] && return 1
+    normalized="${input//,/ }"
+    read -r -a values <<< "$normalized"
+
+    local valid=true
+    local selected_values=()
+    seen=","
+    for value in "${values[@]}"; do
+      if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > ${#options[@]} )); then
+        valid=false
+        break
+      fi
+      if [[ "$seen" != *",$value,"* ]]; then
+        selected_values+=("$value")
+        seen+="$value,"
+      fi
+    done
+
+    if [[ "$valid" == true && ${#selected_values[@]} -gt 0 ]]; then
+      printf '%s\n' "${selected_values[@]}"
+      return 0
+    fi
+    echo "请选择至少一个有效序号" >&2
+  done
+}
+
+cursor_multi_select_menu() {
+  local title="$1"
+  shift
+  local options=("$@")
+  local current=0
+  local key
+  local selected=()
+  local i
+  for i in "${!options[@]}"; do selected+=(false); done
+
+  exec 3</dev/tty 4>/dev/tty
+  tput civis >&4 2>/dev/null || true
+  trap 'tput cnorm >&4 2>/dev/null || true; exec 3<&- 4>&-; trap - RETURN' RETURN
+
+  printf '%b\n' "$C_BOLD" >&4
+  center_text_line 68 "$title" >&4
+  printf '%b' "$C_RESET" >&4
+  printf '%s↑/↓ 移动，Space 勾选，Enter 确认，q 返回%s\n\n' "$C_DIM" "$C_RESET" >&4
+
+  render_multi_select_options() {
+    local index
+    local mark
+    for index in "${!options[@]}"; do
+      [[ "${selected[$index]}" == true ]] && mark="[x]" || mark="[ ]"
+      printf '\r\033[2K' >&4
+      if (( index == current )); then
+        printf '  %s> %s %s%s\n' "$C_REVERSE" "$mark" "${options[$index]}" "$C_RESET" >&4
+      else
+        printf '    %s %s\n' "$mark" "${options[$index]}" >&4
+      fi
+    done
+  }
+
+  render_multi_select_options
+
+  while true; do
+    IFS= read -rsn1 key <&3 || return 1
+    case "$key" in
+      $'\x1b')
+        IFS= read -rsn2 -t 0.1 key <&3 || return 1
+        case "$key" in
+          '[A') ((current--)); (( current < 0 )) && current=$((${#options[@]} - 1)) ;;
+          '[B') ((current++)); (( current >= ${#options[@]} )) && current=0 ;;
+        esac
+        printf '\033[%sA' "${#options[@]}" >&4
+        render_multi_select_options
+        ;;
+      ' ')
+        if [[ "${selected[$current]}" == true ]]; then
+          selected[$current]=false
+        else
+          selected[$current]=true
+        fi
+        printf '\033[%sA' "${#options[@]}" >&4
+        render_multi_select_options
+        ;;
+      '')
+        local selected_count=0
+        for i in "${!selected[@]}"; do
+          [[ "${selected[$i]}" == true ]] && selected_count=$((selected_count + 1))
+        done
+        if (( selected_count == 0 )); then
+          continue
+        fi
+        printf '\n' >&4
+        for i in "${!selected[@]}"; do
+          [[ "${selected[$i]}" == true ]] && printf '%s\n' "$((i + 1))"
+        done
+        return 0
+        ;;
+      q|Q)
+        printf '\n' >&4
+        return 1
+        ;;
+    esac
+  done
+}
+
+multi_select_menu() {
+  local title="$1"
+  shift
+  if [[ -t 0 && -r /dev/tty && -w /dev/tty ]]; then
+    cursor_multi_select_menu "$title" "$@"
+  else
+    plain_multi_select_menu "$title" "$@"
+  fi
+}
+
 choose_platform() {
   local choice
   choice="$(select_menu "请选择目标架构" \
@@ -1603,6 +1791,7 @@ interactive_export() {
     echo "步骤完成：已返回镜像迁移菜单"
     return 0
   }
+  EXCLUDE_IMAGES="$(ask "请输入要排除的镜像（多个用逗号分隔，支持 *，留空不排除）" "$EXCLUDE_IMAGES")" || return 1
   OUT="$(ask "请输入导出文件名" "$OUT")" || return 1
   if ask_yes_no "是否只预演 dry-run" "n"; then DRY_RUN=true; else DRY_RUN=false; fi
   if ask_yes_no "导出后是否恢复本机为 $RESTORE_PLATFORM" "n"; then RESTORE_AFTER_EXPORT=true; else RESTORE_AFTER_EXPORT=false; fi
@@ -1621,10 +1810,72 @@ interactive_export() {
   pause_before_menu "导出流程已结束，按回车返回菜单"
 }
 
-
 load_compose_images_for_menu() {
   cd "$WORKDIR"
   docker compose config 2>/dev/null | awk '/image:/ {print $2}' | sort -u
+}
+
+interactive_export_selected() {
+  MODE="export-selected"
+  WORKDIR="$(ask "请输入工作目录" "$WORKDIR")" || return 1
+  choose_platform || return 1
+
+  local images=()
+  local selected_output
+  local selected_indices=()
+  local selected_images=()
+  local index
+  local selection_file
+  local rc=0
+
+  mapfile -t images < <(load_compose_images_for_menu || true)
+  if (( ${#images[@]} == 0 )); then
+    echo "未从 docker-compose.yml 或 compose.yml 中识别到镜像，请检查工作目录和 Compose 配置。" >&2
+    pause_before_menu "按回车返回镜像迁移菜单"
+    return 0
+  fi
+
+  selected_output="$(multi_select_menu "请选择要导出的多个镜像" "${images[@]}")" || {
+    echo "步骤完成：已取消多选导出"
+    return 0
+  }
+  mapfile -t selected_indices <<< "$selected_output"
+  for index in "${selected_indices[@]}"; do
+    selected_images+=("${images[$((index - 1))]}")
+  done
+
+  selection_file="$(mktemp "${TMPDIR:-/tmp}/by2tool-selected.XXXXXX.list")"
+  printf '%s\n' "${selected_images[@]}" > "$selection_file"
+  IMAGE_LIST="$selection_file"
+  REGISTRY_PREFIX=""
+  EXCLUDE_IMAGES=""
+
+  OUT="selected_images_${PLATFORM_SUFFIX}.tar"
+  OUT="$(ask "请输入导出文件名" "$OUT")" || {
+    rm -f "$selection_file"
+    IMAGE_LIST=""
+    return 1
+  }
+  if ask_yes_no "是否只预演 dry-run" "n"; then DRY_RUN=true; else DRY_RUN=false; fi
+  if ask_yes_no "导出后是否恢复本机为 $RESTORE_PLATFORM" "n"; then RESTORE_AFTER_EXPORT=true; else RESTORE_AFTER_EXPORT=false; fi
+  echo
+  echo "已选择 ${#selected_images[@]} 个镜像："
+  printf '  - %s\n' "${selected_images[@]}"
+  render_export_confirmation
+  echo
+
+  if ask_yes_no "确认开始导出" "y"; then
+    export_images || rc=$?
+    if (( rc != 0 )); then
+      echo "导出执行结束，退出码：$rc"
+    fi
+  else
+    echo "已取消导出"
+  fi
+
+  rm -f "$selection_file"
+  IMAGE_LIST=""
+  pause_before_menu "多选导出流程已结束，按回车返回菜单"
 }
 
 interactive_export_one() {
@@ -1701,17 +1952,19 @@ interactive_image_migration_menu() {
     render_banner
     local choice
     choice="$(select_menu "镜像迁移中心" \
-      "导出全部镜像包" \
-      "导出单个镜像" \
+      "批量导出" \
+      "多选导出" \
+      "单个导出" \
       "导入镜像包" \
       "查看镜像迁移配置" \
       "返回主菜单")" || return 0
     case "$choice" in
       1) interactive_export ;;
-      2) interactive_export_one ;;
-      3) interactive_import ;;
-      4) echo "当前镜像迁移配置："; print_config ;;
-      5) return 0 ;;
+      2) interactive_export_selected ;;
+      3) interactive_export_one ;;
+      4) interactive_import ;;
+      5) echo "当前镜像迁移配置："; print_config ;;
+      6) return 0 ;;
       *) echo "无效选择" ;;
     esac
   done

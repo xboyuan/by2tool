@@ -19,7 +19,8 @@ BoYuan 日常工具集合仓库。
 - 交互式菜单操作，支持键盘光标选择。
 - 从 `docker compose config` 中自动识别镜像。
 - 支持按平台导出镜像，默认 `linux/amd64`，也可以手动选择 ARM 架构。
-- 支持导出全部镜像、按 Harbor/项目路径筛选导出、单独导出某一个镜像。
+- 支持按 Harbor/项目路径批量导出，并可按镜像名或通配符排除。
+- 支持从 Compose 镜像列表中多选或单选镜像导出；多选镜像会打包到同一个文件。
 - 支持导入镜像包，并保留镜像原始 tag。
 - 支持环境检查、服务状态查看、服务启动、停止和重启。
 - 支持从 GitHub 或 Gitee 自动更新脚本。
@@ -66,11 +67,17 @@ cd /home/data/jar && curl -fsSL https://gitee.com/bydzlby/by2tool/raw/main/by2to
 
 ## 镜像导出示例
 
-按默认平台导出 Docker Compose 中的镜像：
+按默认平台批量导出 Docker Compose 中的镜像：
 
 ```bash
 ./by2tool --mode export
 ```
+
+交互运行 `./by2tool` 后，可在“镜像迁移中心”选择：
+
+- `批量导出`：按 Harbor/项目范围筛选并导出。
+- `多选导出`：识别 Compose 镜像列表，勾选多个镜像后打包成一个文件。
+- `单个导出`：从 Compose 镜像列表中选择一个镜像导出。
 
 只导出指定 Harbor 下的镜像：
 
@@ -82,6 +89,22 @@ cd /home/data/jar && curl -fsSL https://gitee.com/bydzlby/by2tool/raw/main/by2to
 
 ```bash
 ./by2tool --mode export --registry-prefix 'harbor.kocel.com:8082/ktmp/*'
+```
+
+导出 Harbor 镜像时排除指定镜像：
+
+```bash
+./by2tool --mode export \
+  --registry-prefix 'harbor.kocel.com:8082/*' \
+  --exclude-image 'harbor.kocel.com:8082/ktmp/tmp-ai:1.0.0'
+```
+
+`--exclude-image` 支持 `*` 通配符，也可以重复使用以排除多个镜像或整个项目路径：
+
+```bash
+./by2tool --mode export \
+  --exclude-image 'harbor.kocel.com:8082/legacy/*' \
+  --exclude-image 'harbor.kocel.com:8082/ktmp/tmp-ai:1.0.0'
 ```
 
 指定 ARM64 平台导出：
@@ -125,4 +148,3 @@ cd /home/data/jar && curl -fsSL https://gitee.com/bydzlby/by2tool/raw/main/by2to
 - 项目交付和环境初始化工具。
 
 新增工具时，建议保持单工具自包含、低依赖、可直接执行，并在 README 的工具列表中补充说明。
-
