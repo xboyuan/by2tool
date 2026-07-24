@@ -23,7 +23,7 @@ BoYuan 日常工具集合仓库。
 - 支持从 Compose 镜像列表中多选或单选镜像导出；多选镜像会打包到同一个文件。
 - 支持导入镜像包，并保留镜像原始 tag。
 - 支持环境检查、服务状态查看、服务启动、停止和重启。
-- 支持从 GitHub 或 Gitee 自动更新脚本。
+- 支持默认从 GitHub 自动更新脚本。
 
 ## 快速安装
 
@@ -31,12 +31,6 @@ GitHub：
 
 ```bash
 cd /home/data/jar && curl -fsSL https://raw.githubusercontent.com/xboyuan/by2tool/main/by2tool -o by2tool && chmod +x by2tool && ./by2tool
-```
-
-国内网络推荐使用 Gitee：
-
-```bash
-cd /home/data/jar && curl -fsSL https://gitee.com/bydzlby/by2tool/raw/main/by2tool -o by2tool && chmod +x by2tool && ./by2tool
 ```
 
 ## 常用命令
@@ -51,12 +45,6 @@ cd /home/data/jar && curl -fsSL https://gitee.com/bydzlby/by2tool/raw/main/by2to
 
 ```bash
 ./by2tool --mode update
-```
-
-指定从 Gitee 更新：
-
-```bash
-./by2tool --mode update --update-source gitee
 ```
 
 指定从 GitHub 更新：
@@ -123,11 +111,8 @@ cd /home/data/jar && curl -fsSL https://gitee.com/bydzlby/by2tool/raw/main/by2to
 
 ## 更新源策略
 
-`by2tool` 默认使用自动更新源：
-
-- 能快速访问 GitHub 时，优先使用 GitHub。
-- GitHub 不可用或访问较慢时，自动切换到 Gitee。
-- 也可以通过 `--update-source github` 或 `--update-source gitee` 手动指定。
+`by2tool` 默认直接从 GitHub Raw 更新，也可以通过 `--update-source`
+临时指定其他 URL 或本机文件路径。
 
 ## 适用场景
 
